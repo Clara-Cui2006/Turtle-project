@@ -41,6 +41,7 @@ export const settingsInputSchema = z.object({
   noteTriggerChars: z.number().int().min(100).max(5000),
   autoDetectQuestions: z.boolean(),
   autoAnswer: z.boolean(),
+  autoQaPaused: z.boolean(),
   useHistory: z.boolean(),
   allowGeneralKnowledge: z.boolean(),
   keepOriginalFiles: z.boolean()
@@ -80,7 +81,7 @@ export interface ApiError { error: { code: string; message: string; details?: un
 export const DEFAULT_SETTINGS: SettingsInput = {
   baseUrl: 'https://api.deepseek.com', noteModel: 'deepseek-flash', autoQaModel: 'deepseek-flash', manualQaModel: 'deepseek-flash', deepModel: 'deepseek-v4-pro',
   stream: true, thinking: false, autoNotes: true, noteIntervalSeconds: 25, noteTriggerChars: 500,
-  autoDetectQuestions: true, autoAnswer: true, useHistory: true, allowGeneralKnowledge: true, keepOriginalFiles: false
+  autoDetectQuestions: true, autoAnswer: true, autoQaPaused: false, useHistory: true, allowGeneralKnowledge: true, keepOriginalFiles: false
 };
 
 export const questionCandidate = (text: string): boolean => {

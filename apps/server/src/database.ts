@@ -85,6 +85,7 @@ export class TurtleDatabase {
   createCourse(input: { name: string; description: string; teacher: string; tags: string[] }): Course {
     const id = randomUUID(), stamp = now();
     this.db.prepare('INSERT INTO courses VALUES(?,?,?,?,?,?,?)').run(id, input.name, input.description, input.teacher, json(input.tags), stamp, stamp);
+    this.index('course',id,id,'',input.name,[input.description,input.teacher,...input.tags].join('\n'));
     return this.course(this.db.prepare('SELECT * FROM courses WHERE id=?').get(id));
   }
   updateCourse(id: string, patch: Record<string, unknown>): Course | undefined {
@@ -92,9 +93,11 @@ export class TurtleDatabase {
     if (!current) return undefined;
     const value = { name: patch.name ?? current.name, description: patch.description ?? current.description, teacher: patch.teacher ?? current.teacher, tags: patch.tags ? json(patch.tags) : current.tags };
     this.db.prepare('UPDATE courses SET name=?,description=?,teacher=?,tags=?,updated_at=? WHERE id=?').run(value.name, value.description, value.teacher, value.tags, now(), id);
+    this.db.prepare(`DELETE FROM search_index WHERE source_type='course' AND source_id=?`).run(id);
+    this.index('course',id,id,'',String(value.name),[value.description,value.teacher,value.tags].join('\n'));
     return this.course(this.db.prepare('SELECT * FROM courses WHERE id=?').get(id));
   }
-  deleteCourse(id: string): boolean { return this.db.prepare('DELETE FROM courses WHERE id=?').run(id).changes > 0; }
+  deleteCourse(id: string): boolean { this.db.prepare('DELETE FROM search_index WHERE course_id=?').run(id); return Number(this.db.prepare('DELETE FROM courses WHERE id=?').run(id).changes) > 0; }
 
   listSessions(courseId?: string): ClassSession[] {
     const rows = courseId ? this.db.prepare('SELECT * FROM class_sessions WHERE course_id=? ORDER BY date DESC,created_at DESC').all(courseId) : this.db.prepare('SELECT * FROM class_sessions ORDER BY date DESC,created_at DESC').all();
@@ -107,6 +110,7 @@ export class TurtleDatabase {
       for (const type of ['full', 'outline']) this.db.prepare('INSERT INTO note_documents VALUES(?,?,?,?,?,?,?)').run(randomUUID(), id, type, 'waiting', null, stamp, stamp);
       this.db.prepare(`INSERT INTO app_preferences(key,value,updated_at) VALUES('currentSessionId',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(id, stamp);
     });
+    this.index('session',id,input.courseId,id,input.name,[input.date,input.teacher,...input.tags,input.remarks,input.legalTerms].join('\n'));
     return this.getSession(id)!;
   }
   getSession(id: string): ClassSession | undefined { const row = this.db.prepare('SELECT * FROM class_sessions WHERE id=?').get(id); return row ? this.session(row) : undefined; }
@@ -118,9 +122,11 @@ export class TurtleDatabase {
     for (const field of fields) { const camel = field.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()); if (patch[camel] !== undefined) next[field] = patch[camel]; }
     if (patch.tags) next.tags = json(patch.tags);
     this.db.prepare('UPDATE class_sessions SET name=?,date=?,teacher=?,tags=?,remarks=?,legal_terms=?,status=?,started_at=?,ended_at=?,updated_at=? WHERE id=?').run(next.name,next.date,next.teacher,next.tags,next.remarks,next.legal_terms,next.status,next.started_at,next.ended_at,now(),id);
+    this.db.prepare(`DELETE FROM search_index WHERE source_type='session' AND source_id=?`).run(id);
+    this.index('session',id,current.course_id,id,String(next.name),[next.date,next.teacher,next.tags,next.remarks,next.legal_terms].join('\n'));
     return this.getSession(id);
   }
-  deleteSession(id: string): boolean { return this.db.prepare('DELETE FROM class_sessions WHERE id=?').run(id).changes > 0; }
+  deleteSession(id: string): boolean { this.db.prepare('DELETE FROM search_index WHERE session_id=?').run(id); return Number(this.db.prepare('DELETE FROM class_sessions WHERE id=?').run(id).changes) > 0; }
   currentSessionId(): string | null { return (this.db.prepare(`SELECT value FROM app_preferences WHERE key='currentSessionId'`).get() as any)?.value ?? null; }
 
   listTranscripts(sessionId: string): TranscriptSegment[] { return this.db.prepare('SELECT * FROM transcript_segments WHERE session_id=? ORDER BY started_at,created_at').all(sessionId).map((r) => this.transcript(r)); }
@@ -223,11 +229,12 @@ export class TurtleDatabase {
 
   search(query: string, sessionId?: string, courseId?: string) {
     const clean = query.trim().replace(/["']/g, ' '); if (!clean) return [];
-    const rows = this.db.prepare('SELECT source_type,source_id,course_id,session_id,title,snippet(search_index,5,\'<mark>\',\'</mark>\',\'…\',24) snippet,bm25(search_index) rank FROM search_index WHERE search_index MATCH ? ORDER BY CASE WHEN session_id=? THEN 0 WHEN course_id=? THEN 1 ELSE 2 END,rank LIMIT 30').all(clean,sessionId ?? '',courseId ?? '') as any[];
+    const match=`"${clean.replaceAll('"','""')}"`;
+    const rows = this.db.prepare('SELECT source_type,source_id,course_id,session_id,title,snippet(search_index,5,\'<mark>\',\'</mark>\',\'…\',24) snippet,bm25(search_index) rank FROM search_index WHERE search_index MATCH ? ORDER BY CASE WHEN session_id=? THEN 0 WHEN course_id=? THEN 1 ELSE 2 END,rank LIMIT 30').all(match,sessionId ?? '',courseId ?? '') as any[];
     return rows.map((r) => ({ sourceType:r.source_type,sourceId:r.source_id,courseId:r.course_id,sessionId:r.session_id,title:r.title,snippet:r.snippet,relevance:-r.rank }));
   }
-  context(sessionId: string, query: string, limit = 12000): { text: string; refs: string[] } {
-    const session = this.getSession(sessionId); const results = this.search(query, sessionId, session?.courseId).slice(0, 12);
+  context(sessionId: string, query: string, limit = 12000, includeHistory = true): { text: string; refs: string[] } {
+    const session = this.getSession(sessionId); const results = this.search(query, sessionId, session?.courseId).filter((item)=>includeHistory||item.sessionId===sessionId).slice(0, 12);
     let text = '', refs: string[] = [];
     for (const r of results) { const piece = `[${r.sourceType}｜${r.title}] ${r.snippet.replace(/<\/?mark>/g,'')}`; if (text.length + piece.length > limit) break; text += `${piece}\n`; refs.push(`${r.sourceType}:${r.sourceId}`); }
     if (!text) { const recent = this.listTranscripts(sessionId).slice(-20); text = recent.map((t) => `[${t.startedAt}] ${t.text}`).join('\n').slice(-limit); refs = recent.map((t) => `transcript:${t.id}`); }

@@ -75,7 +75,8 @@ describe('SQLite 持久化、笔记与问答', () => {
     const transcript = db.addTranscript(session.id,{ startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'行政行为合法性审查',clientResultId:'result-1' });
     expect(db.addTranscript(session.id,{ startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'重复文本',clientResultId:'result-1' }).id).toBe(transcript.id);
     expect(db.updateTranscript(transcript.id,{ text:'行政行为的合法性审查',important:true })?.userEdited).toBe(true);
-    expect(db.search('行政行为',session.id,course.id)[0]?.sourceType).toBe('transcript');
+    expect(db.search('行政行为',session.id,course.id).some((result)=>result.sourceType==='transcript')).toBe(true);
+    expect(db.search('2026-09-18',session.id,course.id).some((result)=>result.sourceType==='session')).toBe(true);
     expect(db.listTranscripts(session.id)).toHaveLength(1);
   });
 

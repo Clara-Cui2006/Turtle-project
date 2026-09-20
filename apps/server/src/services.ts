@@ -69,7 +69,7 @@ export class ClassroomServices {
 
   async detectAndAnswer(sessionId: string, text: string): Promise<void> {
     const settings = this.settings.getPrivate();
-    if (!settings.autoDetectQuestions || !questionCandidate(text)) return;
+    if (!settings.autoDetectQuestions || settings.autoQaPaused || !questionCandidate(text)) return;
     const key = normalizeQuestion(text); const stamp = Date.now();
     if ((this.cooldown.get(key) ?? 0) + 30_000 > stamp) return;
     this.cooldown.set(key, stamp);
@@ -88,7 +88,7 @@ export class ClassroomServices {
   async answer(qaId: string): Promise<ReturnType<TurtleDatabase['getQa']>> {
     const qa = this.db.getQa(qaId); if (!qa) throw new Error('问答不存在');
     return this.queue(`${qa.source}-qa`).enqueue(async () => {
-      const settings = this.settings.getPrivate(); const context = this.db.context(qa.sessionId, qa.question);
+      const settings = this.settings.getPrivate(); const context = this.db.context(qa.sessionId, qa.question,12000,settings.useHistory);
       const controller = new AbortController(); this.controllers.set(`qa:${qa.id}`, controller);
       const raw = await withRetry(() => this.llm.complete({ model: qa.source === 'auto' ? settings.autoQaModel : settings.manualQaModel, system: `${LEGAL_GUARDRAILS}\n按“当前课堂依据、历史课堂依据、导入资料依据、AI一般知识补充、待核实内容”区分作答。课堂记录没有答案时必须明确说明。只输出 JSON：{"answer":"...","evidence":"...","references":["..."]}`, prompt: `问题：${qa.question}\n\n按相关度检索到的有限上下文：\n${context.text || '未找到课堂记录'}\n\n${settings.allowGeneralKnowledge ? '允许一般知识补充，但必须标注。' : '不得使用一般知识补充。'}`, signal: controller.signal, json: true }));
       const parsed = parseJson(raw, answerResponseSchema);
@@ -101,7 +101,7 @@ export class ClassroomServices {
     const settings=this.settings.getPrivate(),normalized=normalizeQuestion(question);
     const qa=this.db.createQa(sessionId,'manual',question,normalized)??this.db.listQa(sessionId).find((item)=>normalizeQuestion(item.question)===normalized);
     if(!qa)throw new Error('无法创建问答');
-    const context=this.db.context(sessionId,question),controller=new AbortController();this.controllers.set(`qa:${qa.id}`,controller);
+    const context=this.db.context(sessionId,question,12000,settings.useHistory),controller=new AbortController();this.controllers.set(`qa:${qa.id}`,controller);
     const options={model:settings.manualQaModel,system:`${LEGAL_GUARDRAILS}\n按“当前课堂依据、历史课堂依据、导入资料依据、AI一般知识补充、待核实内容”清晰分区作答。课堂记录没有答案时必须明确说明。`,prompt:`问题：${question}\n\n有限相关上下文：\n${context.text||'未找到课堂记录'}`,signal:controller.signal};
     let answer='';
     try{if(this.llm.stream){for await(const chunk of this.llm.stream(options)){answer+=chunk;yield chunk;}}else{answer=await this.llm.complete(options);yield answer;}this.db.updateQa(qa.id,{answer,evidence:context.text?'已引用检索到的课堂或资料片段':'课堂记录中未找到直接依据',references:context.refs});}
