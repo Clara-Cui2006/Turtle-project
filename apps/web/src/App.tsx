@@ -4,7 +4,7 @@ import { DEFAULT_SETTINGS } from '@turtle/shared';
 import { api, download } from './api';
 import type { SpeechStatus } from './speech';
 import { transcriptionController } from './transcriptionController';
-import { durableJson, flushOutbox, pendingOutboxCount } from './outbox';
+import { durableJson, flushOutbox, loadSnapshot, pendingOutboxCount, saveSnapshot } from './outbox';
 import { RichNoteEditor } from './RichNoteEditor';
 import turtleNormal from './assets/turtle-normal.png';
 import turtleAngryImage from './assets/turtle-angry.png';
@@ -14,6 +14,7 @@ type SessionDetail = ClassSession & { transcripts: TranscriptSegment[]; noteDocu
 type DocumentInfo = { id: string; course_id: string | null; name: string; file_type: string; size: number; created_at: string };
 type SearchResult = { sourceType: string; sourceId: string; title: string; snippet: string; relevance: number };
 type RecordingInfo = { id:string;sessionId:string;mimeType:string;durationMs:number|null;size:number;createdAt:string };
+type BootstrapSnapshot = { courses:Course[];sessions:ClassSession[];settings:PublicSettings;documents:DocumentInfo[];detail:SessionDetail|null;courseId:string;savedAt:string };
 type RightTab = 'full'|'outline'|'qa'|'ask';
 
 const speechLabels: Record<SpeechStatus,string> = { idle:'尚未开始', requesting:'正在申请麦克风权限', listening:'正在监听', paused:'已暂停', recovering:'正在恢复', 'recovery-failed':'恢复失败，仍在重试', unsupported:'浏览器不支持', denied:'麦克风权限被拒绝', error:'语音识别异常' };
@@ -60,6 +61,7 @@ export function App() {
   const mediaRecorder=useRef<MediaRecorder|null>(null),recordingStream=useRef<MediaStream|null>(null),recordingStarted=useRef(0);
 
   const showError = useCallback((error: unknown) => { const text = error instanceof Error ? error.message : '操作失败'; setMessage(`保存失败：${text}`); },[]);
+  const restoreSnapshot=useCallback(async()=>{try{const cached=await loadSnapshot<BootstrapSnapshot>('bootstrap');if(!cached)return false;setCourses(cached.courses);setSessions(cached.sessions);setSettings(cached.settings);setDocuments(cached.documents);setDetail(cached.detail);detailRef.current=cached.detail;setCourseId(cached.courseId);setMessage(`本地服务未连接，正在显示 ${new Date(cached.savedAt).toLocaleString('zh-CN')} 的本机缓存`);return true;}catch{return false;}},[]);
   const refreshLists = useCallback(async () => {
     setLoadState('loading');
     const [nextCourses,nextSessions,nextSettings,nextDocuments,state] = await Promise.all([
@@ -67,16 +69,18 @@ export function App() {
     ]);
     setCourses(nextCourses); setSessions(nextSessions); setSettings(nextSettings); setDocuments(nextDocuments);
     const selected = state.currentSessionId ?? nextSessions[0]?.id;
+    let selectedDetail:SessionDetail|null=null;
     if (selected) {
       let value = await api<SessionDetail>(`/api/sessions/${selected}`);
       if(!recoveryHandled.current){recoveryHandled.current=true;const unfinished=state.activeSessions.some((item)=>item.id===selected);if(unfinished&&!confirm(`发现未正常结束的课堂“${value.name}”。\n\n确定：继续课堂\n取消：结束并保存`)){const ended=await api<ClassSession>(`/api/sessions/${selected}`,{method:'PATCH',body:JSON.stringify({status:'ended',endedAt:new Date().toISOString()})});value={...value,...ended};}}
-      setDetail(value);detailRef.current=value;setRecordings(await api<RecordingInfo[]>(`/api/sessions/${selected}/recordings`));setCourseId(value.courseId);
+      selectedDetail=value;setDetail(value);detailRef.current=value;setRecordings(await api<RecordingInfo[]>(`/api/sessions/${selected}/recordings`));setCourseId(value.courseId);
     }
-    else setCourseId(nextCourses[0]?.id ?? '');setLoadState('ready');
+    else {setDetail(null);detailRef.current=null;setCourseId(nextCourses[0]?.id ?? '');}
+    void saveSnapshot<BootstrapSnapshot>('bootstrap',{courses:nextCourses,sessions:nextSessions,settings:nextSettings,documents:nextDocuments,detail:selectedDetail,courseId:selectedDetail?.courseId??nextCourses[0]?.id??'',savedAt:new Date().toISOString()}).catch(()=>undefined);setLoadState('ready');
   },[]);
   const reloadDetail = useCallback(async () => { if (detail) {setDetail(await api<SessionDetail>(`/api/sessions/${detail.id}`));setRecordings(await api<RecordingInfo[]>(`/api/sessions/${detail.id}/recordings`));} },[detail]);
 
-  useEffect(() => { refreshLists().catch((error)=>{setLoadState('error');showError(error);}); },[refreshLists,showError]);
+  useEffect(() => { refreshLists().catch(async()=>{setLoadState('error');if(!await restoreSnapshot())setMessage('本地服务暂时无法连接，且尚无可恢复的页面缓存');}); },[refreshLists,restoreSnapshot]);
   useEffect(()=>transcriptionController.subscribe((state)=>{setStatus(state.status);setStatusDetail(state.detail);setInterim(state.interim);setDiagnostics(state.events);}),[]);
   useEffect(()=>{detailRef.current=detail;transcriptionController.setSession(detail?.id??null,(text)=>{const current=detailRef.current;if(!current)return;const stamp=new Date().toISOString(),id=crypto.randomUUID(),optimistic:TranscriptSegment={id,sessionId:current.id,startedAt:stamp,endedAt:stamp,originalText:text,text,isFinal:true,userEdited:false,important:false,createdAt:stamp,updatedAt:stamp};setMessage('正在保存');void durableJson<TranscriptSegment>(`/api/sessions/${current.id}/transcripts`,{method:'POST',body:JSON.stringify({startedAt:stamp,endedAt:stamp,text,clientResultId:id})},optimistic).then(({value,queued})=>{setDetail((state)=>state?{...state,transcripts:[...state.transcripts.filter((item)=>item.id!==value.id),value]}:state);setMessage(queued?'网络中断，已进入本地待同步队列':'已保存');if(!queued)window.setTimeout(()=>reloadDetail().catch(showError),1200);}).catch(showError);});},[detail?.id,reloadDetail,showError]);
   useEffect(()=>{void flushOutbox();},[]);
@@ -94,7 +98,7 @@ export function App() {
   const currentCourse = courses.find((c) => c.id === (detail?.courseId || courseId));
   const courseSessions = sessions.filter((s) => !courseId || s.courseId === courseId);
   const note = (type: 'full'|'outline') => detail?.noteDocuments.find((n) => n.type === type);
-  const aiLabel = settings.apiKeyConfigured ? 'DeepSeek 可用' : 'DeepSeek 未配置';
+  const aiLabel = loadState==='error' ? '本地服务未连接' : settings.apiKeyConfigured ? 'DeepSeek 可用' : 'DeepSeek 未配置';
 
   async function openSession(id:string) { const [value,audio] = await Promise.all([api<SessionDetail>(`/api/sessions/${id}`),api<RecordingInfo[]>(`/api/sessions/${id}/recordings`)]); setDetail(value);setRecordings(audio);detailRef.current=value;setCourseId(value.courseId); }
   async function newCourse() { const name = prompt('课程名称'); if (!name?.trim()) return; const teacher = prompt('授课教师（可留空）') ?? ''; const description=prompt('课程描述（可留空）')??'';const tags=(prompt('标签（用逗号分隔，可留空）')??'').split(/[,，]/).map((item)=>item.trim()).filter(Boolean),stamp=new Date().toISOString(),id=crypto.randomUUID(),optimistic:Course={id,name,teacher,description,tags,createdAt:stamp,updatedAt:stamp};const result=await durableJson<Course>('/api/courses',{method:'POST',body:JSON.stringify({id,name,teacher,description,tags})},optimistic);setCourses((items)=>[result.value,...items]);setCourseId(result.value.id);if(result.queued)setMessage('课程已存入本地待同步队列'); }
@@ -179,7 +183,7 @@ export function App() {
             return <button role="tab" aria-selected={rightTab===id} className={rightTab===id?'active':''} onClick={async()=>{setRightTab(id);if(id==='qa'&&unread){await Promise.all((detail?.qa??[]).filter((item)=>!item.readAt).map((item)=>api(`/api/questions/${item.id}/read`,{method:'PATCH'})));await reloadDetail();}}} key={id}>{label}{unread>0&&settings.unreadQuestionBadges?<span className="badge">{unread>9?'9+':unread}</span>:null}</button>;
           })}
         </div>
-        {(rightTab==='full'||rightTab==='outline') && <NoteView document={note(rightTab)} sessionId={detail?.id??''} configured={settings.apiKeyConfigured} onSettings={()=>setSettingsOpen(true)} onUpdate={forceNotes} onUndo={()=>undoNote(rightTab)} onSaved={(value)=>setDetail((current)=>current?{...current,noteDocuments:current.noteDocuments.map((item)=>item.id===value.id?value:item)}:current)} onError={showError}/>}
+        {(rightTab==='full'||rightTab==='outline') && <NoteView document={note(rightTab)} sessionId={detail?.id??''} configured={loadState==='error'?null:settings.apiKeyConfigured} onSettings={()=>setSettingsOpen(true)} onUpdate={forceNotes} onUndo={()=>undoNote(rightTab)} onSaved={(value)=>setDetail((current)=>current?{...current,noteDocuments:current.noteDocuments.map((item)=>item.id===value.id?value:item)}:current)} onError={showError}/>}
         {rightTab==='qa' && <QaView items={detail?.qa??[]} onAdd={addQa} onRemove={removeQa} onEdit={updateQa} onReload={reloadDetail}/>}
         {rightTab==='ask' && <div className="ask-panel"><h2>向课堂提问</h2><div className="shortcuts">{shortcuts.map((item)=><button key={item} onClick={()=>submitQuestion(item)}>{item}</button>)}</div><label htmlFor="question">问题</label><textarea id="question" rows={6} value={question} onChange={(e)=>setQuestion(e.target.value)} onKeyDown={(e:KeyboardEvent<HTMLTextAreaElement>)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();submitQuestion();}}} placeholder="结合当前课堂、历史课堂和导入资料提问…"/>{streamText&&<div className="stream-answer" aria-live="polite">{streamText}</div>}<button className="primary wide" onClick={()=>submitQuestion()} disabled={asking||!question.trim()}>{asking?'正在生成，可继续转写…':'发送（Enter）'}</button>{asking&&<button className="wide" onClick={()=>askController.current?.abort()}>停止生成</button>}{!settings.apiKeyConfigured&&<button className="link" onClick={()=>setSettingsOpen(true)}>尚未配置 DeepSeek，前往设置</button>}</div>}
       </aside>
@@ -190,8 +194,8 @@ export function App() {
   </div>;
 }
 
-function NoteView({document,sessionId,configured,onSettings,onUpdate,onUndo,onSaved,onError}:{document:NoteDocumentV2|undefined;sessionId:string;configured:boolean;onSettings():void;onUpdate():void;onUndo():void;onSaved(document:NoteDocumentV2):void;onError(error:unknown):void}) {
-  return <div className="note-view"><div className="note-tools"><span>{document?.status==='generating'?'正在修订':document?.status==='complete'?'已更新':document?.status==='failed'?'修订失败，待重试':'等待整理'}{document?.pendingSuggestions?` · ${document.pendingSuggestions} 条建议待处理`:''}</span><button onClick={onUpdate}>整理当前笔记</button><button onClick={onUndo}>撤销修订</button></div>{!configured&&<div className="notice">尚未配置 DeepSeek。富文本编辑和本地自动保存仍可使用。<button onClick={onSettings}>前往设置</button></div>}{document?<RichNoteEditor document={document} sessionId={sessionId} onSaved={onSaved} onError={onError}/>:<div className="empty"><span>正在准备笔记文档</span></div>}</div>;
+function NoteView({document,sessionId,configured,onSettings,onUpdate,onUndo,onSaved,onError}:{document:NoteDocumentV2|undefined;sessionId:string;configured:boolean|null;onSettings():void;onUpdate():void;onUndo():void;onSaved(document:NoteDocumentV2):void;onError(error:unknown):void}) {
+  return <div className="note-view"><div className="note-tools"><span>{document?.status==='generating'?'正在修订':document?.status==='complete'?'已更新':document?.status==='failed'?'修订失败，待重试':'等待整理'}{document?.pendingSuggestions?` · ${document.pendingSuggestions} 条建议待处理`:''}</span><button onClick={onUpdate}>整理当前笔记</button><button onClick={onUndo}>撤销修订</button></div>{configured===null?<div className="notice">本地服务未连接，无法确认 DeepSeek 配置；不会将其显示为“未配置”。</div>:!configured&&<div className="notice">尚未配置 DeepSeek。富文本编辑和本地自动保存仍可使用。<button onClick={onSettings}>前往设置</button></div>}{document?<RichNoteEditor document={document} sessionId={sessionId} onSaved={onSaved} onError={onError}/>:<div className="empty"><span>正在准备笔记文档</span></div>}</div>;
 }
 
 function QaView({items,onAdd,onRemove,onEdit,onReload}:{items:QaItem[];onAdd(id:string,target:'full'|'outline'|'both'):void;onRemove(id:string):void;onEdit(item:QaItem,field:'question'|'answer'):void;onReload():void}) {
