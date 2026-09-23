@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Document, HeadingLevel, Packer, Paragraph } from 'docx';
+import mammoth from 'mammoth';
 import request from 'supertest';
 import { DEFAULT_SETTINGS, maskApiKey, normalizeQuestion, questionCandidate } from '@turtle/shared';
 import { createApp } from '../apps/server/src/app.js';
@@ -12,12 +13,14 @@ import { ClassroomServices } from '../apps/server/src/services.js';
 import { SettingsStore } from '../apps/server/src/settings.js';
 import type { CompletionOptions, LlmProvider } from '../apps/server/src/ai.js';
 import { BrowserTranscriptionProvider, type RecognitionLike, type SpeechStatus } from '../apps/web/src/speech.js';
+import { classifyLocally } from '../apps/server/src/relevance.js';
 
 class MockLlm implements LlmProvider {
   calls: CompletionOptions[] = [];
   async complete(options: CompletionOptions): Promise<string> {
     this.calls.push(options);
-    if (options.system.includes('blocks')) return JSON.stringify({ blocks: [{ section: options.system.includes('考试复习提纲') ? '一级知识点' : '老师讲授内容', content: options.system.includes('考试复习提纲') ? '- 行政行为的合法性' : '老师说明了行政行为合法性的判断方法。' }] });
+    if(options.system.includes('相关性分类器'))return JSON.stringify({category:'substantive_legal',confidence:.9,rationale:'测试法律内容'});
+    if(options.system.includes('文档补丁 Schema')){const version=Number(/文档版本：(\d+)/.exec(options.prompt)?.[1]??0),outline=options.system.includes('复习提纲');return JSON.stringify({baseVersion:version,reason:'测试微更新',operations:[{op:'createSection',title:outline?'行政行为要点':'行政行为的合法性',headingLevel:1,parentId:null,content:{type:'paragraph',content:[{type:'text',text:outline?'核心：合法性审查':'老师说明了行政行为合法性的判断方法。'}]},sourceTranscriptIds:[]}]});}
     return JSON.stringify({ answer: '当前课堂依据：应审查行政行为的合法性。\nAI一般知识补充：无。', evidence: '课堂转写 10:00', references: ['课堂转写'] });
   }
 }
@@ -85,38 +88,36 @@ describe('SQLite 持久化、笔记与问答', () => {
     settings.save({ ...DEFAULT_SETTINGS, apiKey:'unit-key', noteTriggerChars:100 });
     db.addTranscript(session.id,{ startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'行政行为为什么必须符合法律规定？'.repeat(5) });
     const service = new ClassroomServices(db,settings,llm);
-    const notes = await service.updateNotes(session.id,true);
-    expect(notes.find((n)=>n.type==='full')?.blocks[0]?.section).toBe('老师讲授内容');
-    expect(notes.find((n)=>n.type==='outline')?.blocks[0]?.section).toBe('一级知识点');
-    const block = notes[0]!.blocks[0]!; db.updateNoteBlock(block.id,'用户自己的笔记');
-    db.appendNoteBlocks(notes[0]!.id,[{section:'建议补充',content:'新内容'}]);
-    expect(db.getNotes(session.id)[0]?.blocks.find((b)=>b.id===block.id)?.locked).toBe(true);
-    expect(db.undoNote(notes[0]!.id)).toBe(true);
-    expect(db.getNotes(session.id)[0]?.blocks.some((b)=>b.content==='用户自己的笔记')).toBe(true);
+    await service.updateNotes(session.id,true);const documents=db.getNoteDocuments(session.id);
+    expect(documents.find((n)=>n.type==='full')?.nodes.some((node)=>node.textContent==='行政行为的合法性')).toBe(true);
+    expect(documents.find((n)=>n.type==='outline')?.nodes.some((node)=>node.textContent==='行政行为要点')).toBe(true);
+    const document=documents[0]!,node=document.nodes[0]!;const userContent={type:'doc',content:[{type:'heading',attrs:{level:1,nodeId:node.id},content:[{type:'text',text:'用户自己的笔记'}]}]};const saved=db.saveNoteDocument(document.id,document.version,userContent,node.id);
+    const protectedNode=saved.nodes[0]!;db.applyNotePatch(saved.id,saved.version,'AI 尝试修改',[{op:'updateNode',nodeId:protectedNode.id,content:{type:'heading',attrs:{level:1,nodeId:protectedNode.id},content:[{type:'text',text:'AI 覆盖'}]}}]);
+    expect(db.getNoteDocument(saved.id)?.nodes[0]?.textContent).toBe('用户自己的笔记');expect(db.getNoteDocument(saved.id)?.pendingSuggestions).toBe(1);expect(db.undoNoteDocument(saved.id)?.nodes[0]?.textContent).toBe('用户自己的笔记');
   });
 
   it('字数与时间触发会防抖，并发调用不重复处理同一转写', async () => {
     vi.useFakeTimers(); const {session}=seed(); settings.save({...DEFAULT_SETTINGS,apiKey:'unit-key',noteTriggerChars:100,noteIntervalSeconds:10});
     const service=new ClassroomServices(db,settings,llm);
-    db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'法学课堂内容'.repeat(25)});
+    db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'法律课堂内容'.repeat(25)});
     service.scheduleNotes(session.id);service.scheduleNotes(session.id);
     await vi.advanceTimersByTimeAsync(799);expect(llm.calls).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1);expect(llm.calls).toHaveLength(2);
-    vi.advanceTimersByTime(1);db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'新的最终转写'.repeat(20)});
+    vi.advanceTimersByTime(1);db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'新的行政法最终转写'.repeat(20)});
     await Promise.all([service.updateNotes(session.id,true),service.updateNotes(session.id,true)]);
     expect(llm.calls).toHaveLength(4);
-    vi.advanceTimersByTime(1);db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'短内容'});
+    vi.advanceTimersByTime(1);db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'行政法短内容'});
     service.scheduleNotes(session.id);await vi.advanceTimersByTimeAsync(9_999);expect(llm.calls).toHaveLength(4);
     await vi.advanceTimersByTimeAsync(1);expect(llm.calls).toHaveLength(6);
   });
 
   it('AI 失败保留待处理内容并标记失败，稍后可重试', async () => {
-    const {session}=seed();settings.save({...DEFAULT_SETTINGS,apiKey:'unit-key'});db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'应当保留的待处理课堂内容'});
+    const {session}=seed();settings.save({...DEFAULT_SETTINGS,apiKey:'unit-key'});db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'行政法上应当保留的待处理法律课堂内容'});
     const failing: LlmProvider={complete:async()=>{throw new Error('模拟网络故障');}};
     await expect(new ClassroomServices(db,settings,failing).updateNotes(session.id,true)).rejects.toThrow('模拟网络故障');
-    expect(db.getNotes(session.id).every((note)=>note.lastProcessedAt===null&&note.status==='failed')).toBe(true);
+    expect(db.getNoteDocuments(session.id).every((note)=>note.status==='failed')).toBe(true);
     await new ClassroomServices(db,settings,llm).updateNotes(session.id,true);
-    expect(db.getNotes(session.id).every((note)=>note.blocks.length===1&&note.lastProcessedAt!==null)).toBe(true);
+    expect(db.getNoteDocuments(session.id).every((note)=>note.nodes.length>=2&&note.status==='complete')).toBe(true);
   });
 
   it('自动问题去重，答案默认不入笔记，可分别加入和移除', async () => {
@@ -157,6 +158,60 @@ describe('导入与导出', () => {
       if(format==='docx') expect(file.buffer.subarray(0,2).toString()).toBe('PK'); else expect(file.buffer.toString('utf8')).toContain('课堂正文');
     }
   });
+
+  it('富文本 Word 导出保留多级标题、表格、图片和前文顺序',async()=>{
+    const {session}=seed(),document=db.getNoteDocuments(session.id).find((item)=>item.type==='full')!,assetPath=join(directory,'test.png');writeFileSync(assetPath,Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=','base64'));const asset=db.addEditorAsset({sessionId:session.id,filename:'证据图.png',mimeType:'image/png',size:68,path:assetPath,altText:'证据结构图'});
+    const content={type:'doc',content:[{type:'heading',attrs:{level:1,nodeId:crypto.randomUUID()},content:[{type:'text',text:'行政行为效力'}]},{type:'heading',attrs:{level:2,nodeId:crypto.randomUUID()},content:[{type:'text',text:'无效行政行为'}]},{type:'table',attrs:{nodeId:crypto.randomUUID()},content:[{type:'tableRow',content:[{type:'tableHeader',content:[{type:'paragraph',content:[{type:'text',text:'比较项'}]}]},{type:'tableCell',content:[{type:'paragraph',content:[{type:'text',text:'法律效果'}]}]}]}]},{type:'image',attrs:{nodeId:crypto.randomUUID(),src:`/api/editor-assets/${asset.id}/content`,alt:'证据结构图'}}]};db.saveNoteDocument(document.id,document.version,content,null);
+    const exported=await exportSession(db,session.id,'docx','full'),html=(await mammoth.convertToHtml({buffer:exported.buffer},{convertImage:mammoth.images.imgElement(async()=>({src:'embedded'}))})).value;expect(html).toContain('<strong>一、</strong>行政行为效力');expect(html).toContain('<strong>（一）</strong>无效行政行为');expect(html).toContain('<table>');expect(html).toContain('<img');expect(exported.buffer.toString()).not.toContain(directory);
+  });
+});
+
+describe('内容相关性、结构化文档与持久化恢复',()=>{
+  it('区分闲聊、课程安排、不完整片段，并保留法律教学中的生活事实',()=>{
+    expect(classifyLocally('周末天气真不错，大家吃饭了吗')).toMatchObject({category:'small_talk'});
+    expect(classifyLocally('这个下周期中考试，记得交作业')).toMatchObject({category:'course_context'});
+    expect(classifyLocally('那么关于这个')).toMatchObject({category:'uncertain'});
+    expect(classifyLocally('甲把自己的房子交给乙管理，后来乙对外声称有代理权',['我们现在讨论表见代理的构成要件'])).toMatchObject({category:'substantive_legal'});
+  });
+
+  it('用户手动分类不会被后续 AI 分类覆盖，原始转写仍保留',()=>{
+    const {session}=seed(),segment=db.addTranscript(session.id,{startedAt:new Date().toISOString(),endedAt:new Date().toISOString(),text:'今天聊聊天气'});
+    db.setTranscriptRelevance(segment.id,'substantive_legal',1,true,'用户决定');db.setTranscriptRelevance(segment.id,'small_talk',.9,false,'AI决定');
+    const restored=db.listTranscripts(session.id)[0]!;expect(restored.text).toBe('今天聊聊天气');expect(restored.relevance).toBe('substantive_legal');expect(restored.relevanceManual).toBe(true);
+  });
+
+  it('支持前文插入、移动防循环、表格重组、版本冲突与撤销',()=>{
+    const {session}=seed(),document=db.getNoteDocuments(session.id).find((item)=>item.type==='full')!;
+    const first=db.applyNotePatch(document.id,document.version,'创建概念',[{op:'createSection',title:'行政行为的效力',headingLevel:1,parentId:null,content:{type:'paragraph',content:[{type:'text',text:'效力说明'}]},sourceTranscriptIds:[]}]);
+    const heading=first.nodes.find((node)=>node.type==='heading')!,paragraph=first.nodes.find((node)=>node.type==='paragraph')!;
+    const supplemented=db.applyNotePatch(first.id,first.version,'回填案例',[{op:'addExample',targetNodeId:heading.id,content:{type:'paragraph',content:[{type:'text',text:'典型案例'}]},sourceTranscriptIds:[]}]);
+    expect(supplemented.nodes.some((node)=>node.parentId===heading.id&&node.textContent==='典型案例')).toBe(true);
+    expect(()=>db.applyNotePatch(supplemented.id,first.version,'旧版本',[])).toThrow('版本冲突');
+    expect(()=>db.applyNotePatch(supplemented.id,supplemented.version,'循环',[{op:'moveNode',nodeId:heading.id,parentId:heading.id,position:0}])).toThrow('自己的父节点');
+    const table={type:'table',content:[{type:'tableRow',content:[{type:'tableHeader',content:[{type:'paragraph',content:[{type:'text',text:'比较项'}]}]}]}]};
+    const converted=db.applyNotePatch(supplemented.id,supplemented.version,'转换表格',[{op:'convertToTable',nodeIds:[paragraph.id],table}]);expect(converted.nodes.some((node)=>node.type==='table')).toBe(true);expect(db.undoNoteDocument(converted.id)?.nodes.some((node)=>node.id===paragraph.id)).toBe(true);
+  });
+
+  it('数据库关闭重启后课程仍存在，健康接口区分真实数据并暴露稳定绝对路径',async()=>{
+    const folder=mkdtempSync(join(tmpdir(),'turtle-restart-'));try{const first=new TurtleDatabase(folder);first.createCourse({name:'重启保留课',description:'',teacher:'',tags:[]});first.close();const reopened=new TurtleDatabase(folder);expect(reopened.listCourses()[0]?.name).toBe('重启保留课');reopened.close();}finally{rmSync(folder,{recursive:true,force:true});}
+    const response=await request(createApp({db,settings,llm}).app).get('/api/health').expect(200);expect(response.body).toMatchObject({ok:true,schemaVersion:2,writable:true});expect(response.body.databasePath).toContain('turtle.db');
+  });
+
+  it('旧 note_blocks 非破坏迁移到 v2 文档并在迁移前生成备份',()=>{
+    const folder=mkdtempSync(join(tmpdir(),'turtle-migration-'));try{const legacy=new TurtleDatabase(folder);const course=legacy.createCourse({name:'旧课程',description:'',teacher:'',tags:[]}),session=legacy.createSession({courseId:course.id,name:'旧课堂',date:'2026-09-22',teacher:'',tags:[],remarks:'',legalTerms:''}),note=legacy.getNotes(session.id)[0]!;legacy.addUserNoteBlock(note.id,'旧版笔记迁移内容','绝不能丢失的原文字');legacy.db.exec('PRAGMA foreign_keys=OFF; DROP TABLE qa_note_links; DROP TABLE note_node_sources; DROP TABLE note_suggestions; DROP TABLE note_patch_jobs; DROP TABLE note_revisions_v2; DROP TABLE note_nodes; DROP TABLE note_documents_v2; DROP TABLE transcript_relevance; DROP TABLE editor_assets; DROP TABLE transcription_events; DROP TABLE persistence_operations; DROP TABLE audio_recordings; DELETE FROM schema_migrations WHERE version=2; PRAGMA user_version=1;');legacy.close();const migrated=new TurtleDatabase(folder);const document=migrated.getNoteDocuments(session.id)[0]!;expect(document.nodes.some((node)=>node.textContent==='绝不能丢失的原文字')).toBe(true);expect(migrated.getNotes(session.id)[0]?.blocks.some((block)=>block.content==='绝不能丢失的原文字')).toBe(true);expect(readdirSync(join(folder,'backups')).some((name)=>name.startsWith('turtle-pre-migration-v2-'))).toBe(true);migrated.close();}finally{rmSync(folder,{recursive:true,force:true});}
+  });
+
+  it('损坏设置会保留副本并显示诊断，不静默伪装成正常空设置',()=>{
+    writeFileSync(settings.file,'{broken','utf8');const recovered=new SettingsStore(directory);expect(recovered.getDiagnostic().ok).toBe(false);expect(readdirSync(directory).some((name)=>name.startsWith('local-settings.json.corrupt-'))).toBe(true);
+  });
+
+  it('自动问题未读状态持久化，阅读和软删除同步列表',()=>{
+    const {session}=seed(),qa=db.createQa(session.id,'auto','行政许可的构成要件是什么？','行政许可的构成要件是什么',false,true,'concept',.95)!;expect(db.listQa(session.id).filter((item)=>!item.readAt)).toHaveLength(1);expect(db.markQaRead(qa.id)?.readAt).toBeTruthy();expect(db.deleteQa(qa.id)).toBe(true);expect(db.listQa(session.id)).toHaveLength(0);expect(db.getQa(qa.id)?.deletedAt).toBeTruthy();
+  });
+
+  it('问答按指定节点插入且同一文档不重复，并可同时移除链接',()=>{
+    const {session}=seed(),document=db.getNoteDocuments(session.id)[0]!,created=db.applyNotePatch(document.id,document.version,'建立问题区',[{op:'createSection',title:'课堂问题',headingLevel:1,parentId:null,sourceTranscriptIds:[]}]),target=created.nodes[0]!,qa=db.createQa(session.id,'auto','行政许可与行政确认有什么区别？','行政许可与行政确认有什么区别',false,true,'comparison',.96)!;db.updateQa(qa.id,{answer:'二者在行为性质与法律效果上不同。'});db.insertQaIntoDocuments(qa.id,created.type,target.id);const count=()=>Number((db.db.prepare('SELECT COUNT(*) count FROM qa_note_links WHERE qa_id=? AND document_id=?').get(qa.id,created.id) as any).count);expect(count()).toBe(1);db.insertQaIntoDocuments(qa.id,created.type,target.id);expect(count()).toBe(1);db.removeQaFromNotes(qa.id);expect(count()).toBe(0);
+  });
 });
 
 describe('浏览器语音识别状态机', () => {
@@ -177,7 +232,7 @@ describe('浏览器语音识别状态机', () => {
     const provider=new BrowserTranscriptionProvider(()=>{const item=new FakeRecognition();instances.push(item);return item;},{onInterim:()=>{},onFinal:()=>{},onStatus:(v)=>states.push(v)},2);
     provider.start(); instances[0]!.onend?.(); vi.advanceTimersByTime(500); expect(instances).toHaveLength(2);
     instances[1]!.onend?.(); vi.advanceTimersByTime(1000); expect(instances).toHaveLength(3);
-    instances[2]!.onend?.(); expect(states.at(-1)).toBe('error');
+    instances[2]!.onend?.(); expect(states.at(-1)).toBe('recovery-failed');
     provider.stop(); vi.runAllTimers(); expect(instances).toHaveLength(3);
   });
 });
@@ -194,8 +249,17 @@ describe('API 集成核心流程', () => {
     const qa=(await request(app).post(`/api/sessions/${session.id}/questions`).send({question:'证据为什么必须合法？',source:'auto'}).expect(201)).body;
     await request(app).post(`/api/questions/${qa.id}/add-to-note`).send({target:'both'}).expect(200);
     const restored=(await request(app).get(`/api/sessions/${session.id}`).expect(200)).body;
-    expect(restored.transcripts).toHaveLength(1); expect(restored.notes.every((n:any)=>n.blocks.length>0)).toBe(true); expect(restored.qa[0].status).toBe('both');
+    expect(restored.transcripts).toHaveLength(1); expect(restored.noteDocuments.every((n:any)=>n.nodes.length>0)).toBe(true); expect(restored.qa[0].status).toBe('both');
     const exported=await request(app).post(`/api/sessions/${session.id}/export`).send({format:'docx',scope:'package'}).buffer(true).parse((response,done)=>{const chunks:Buffer[]=[];response.on('data',(chunk:Buffer)=>chunks.push(chunk));response.on('end',()=>done(null,Buffer.concat(chunks)));}).expect(200);
     expect((exported.body as Buffer).subarray(0,2).toString()).toBe('PK'); expect(JSON.stringify((await request(app).get('/api/settings')).body)).not.toContain('unit-key');
+  });
+
+  it('本地录音分段可列出、播放、导出和删除，个人数据备份排除秘密与内部路径',async()=>{
+    const {app}=createApp({db,settings,llm});settings.save({...DEFAULT_SETTINGS,apiKey:'unit-private-key'});const {session}=seed();
+    const created=(await request(app).post(`/api/sessions/${session.id}/recordings`).field('durationMs','30000').attach('file',Buffer.from('local-audio-chunk'),{filename:'chunk.webm',contentType:'audio/webm'}).expect(201)).body;
+    expect((await request(app).get(`/api/sessions/${session.id}/recordings`).expect(200)).body).toHaveLength(1);
+    expect((await request(app).get(`/api/recordings/${created.id}/content`).expect(200)).body.toString()).toContain('local-audio-chunk');
+    const personal=await request(app).get('/api/backups/personal-data').expect(200);const text=JSON.stringify(personal.body);expect(personal.body.format).toBe('turtle-personal-data-v1');expect(text).not.toContain('unit-private-key');expect(text).not.toContain(directory);
+    await request(app).delete(`/api/recordings/${created.id}`).expect(204);expect((await request(app).get(`/api/sessions/${session.id}/recordings`)).body).toHaveLength(0);
   });
 });

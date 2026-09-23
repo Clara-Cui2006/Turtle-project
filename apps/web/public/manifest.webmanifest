@@ -1,0 +1,11 @@
+{
+  "name": "课堂实时助手",
+  "short_name": "课堂助手",
+  "description": "Windows 本机课堂实时转写、结构化法律笔记和课堂问答",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#edf1ed",
+  "theme_color": "#17251f",
+  "icons": [{"src":"/turtle-normal.png","sizes":"1254x1254","type":"image/png","purpose":"any"}]
+}
