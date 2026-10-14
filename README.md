@@ -50,6 +50,8 @@ npm run dev
 - 后端：<http://localhost:3001>
 - 健康检查：<http://localhost:3001/api/health>
 
+日常使用请直接双击仓库根目录的 `start-turtle.cmd`。它会在需要时构建项目，以隐藏的单进程生产模式启动页面和 API，并打开 <http://127.0.0.1:5173>。关闭浏览器不会停止服务；电脑重启后重新双击即可。运行中的服务会被复用，不会重复启动。
+
 其他命令：
 
 ```powershell

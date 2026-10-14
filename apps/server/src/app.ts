@@ -2,6 +2,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import multer from 'multer';
 import { accessSync, constants, copyFileSync, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { backup, DatabaseSync } from 'node:sqlite';
 import { z, ZodError } from 'zod';
@@ -30,7 +31,7 @@ const patchSessionSchema = sessionInputSchema.omit({ courseId: true }).partial()
 const patchTranscriptSchema = z.object({ text: z.string().trim().min(1).max(20000).optional(), important: z.boolean().optional() }).refine((value) => Object.keys(value).length > 0);
 const patchQuestionSchema = z.object({ question: z.string().trim().min(2).max(4000).optional(), answer: z.string().max(30000).optional(), archived: z.boolean().optional() }).refine((value) => Object.keys(value).length > 0);
 
-export interface AppDependencies { db?: TurtleDatabase; settings?: SettingsStore; llm?: LlmProvider }
+export interface AppDependencies { db?: TurtleDatabase; settings?: SettingsStore; llm?: LlmProvider; webRoot?: string }
 
 export function createApp(deps: AppDependencies = {}) {
   const paths = getPaths(),dataDir=paths.root,startedAt=new Date().toISOString();
@@ -137,6 +138,12 @@ export function createApp(deps: AppDependencies = {}) {
   app.delete('/api/documents/:id', (req, res) => db.deleteDocument(req.params.id!) ? res.status(204).end() : res.status(404).json({ error: { code: 'NOT_FOUND', message: '资料不存在' } }));
   app.post('/api/sessions/:id/export', async (req, res, next) => { try { const input = exportInputSchema.parse(req.body); const file = await exportSession(db,req.params.id!,input.format,input.scope); res.setHeader('Content-Type',file.contentType); res.setHeader('Content-Disposition',`attachment; filename*=UTF-8''${encodeURIComponent(file.filename)}`); res.send(file.buffer); } catch (error) { next(error); } });
   app.get('/api/search', (req, res) => { const query = z.string().min(1).parse(req.query.q); res.json(db.search(query,typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined,typeof req.query.courseId === 'string' ? req.query.courseId : undefined)); });
+
+  const webRoot=deps.webRoot??fileURLToPath(new URL('../../web/dist',import.meta.url)),webIndex=join(webRoot,'index.html');
+  if(existsSync(webIndex)){
+    app.use(express.static(webRoot));
+    app.use((req,res,next)=>req.method==='GET'&&!req.path.startsWith('/api/')?res.sendFile(webIndex):next());
+  }
 
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (error instanceof ZodError) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: '输入内容不符合要求', details: error.issues } });
