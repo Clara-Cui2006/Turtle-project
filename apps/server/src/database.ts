@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
-import type { ClassSession, Course, NoteBlock, NoteDocument, NoteDocumentV2, NoteNode, QaItem, RelevanceCategory, SessionInput, TranscriptSegment } from '@turtle/shared';
+import type { ClassSession, Course, ManualNoteDocument, NoteBlock, NoteDocument, NoteDocumentV2, NoteNode, QaItem, RelevanceCategory, SessionInput, TranscriptSegment } from '@turtle/shared';
 
 const now = () => new Date().toISOString();
 const json = (value: unknown) => JSON.stringify(value);
@@ -119,6 +119,18 @@ export class TurtleDatabase {
         this.db.exec('PRAGMA user_version = 2');
       });
     }
+    if(version<3){
+      if(!memory&&existsSync(this.databasePath)){const backupDir=join(dataDir,'backups');mkdirSync(backupDir,{recursive:true});const target=join(backupDir,`turtle-pre-migration-v3-${new Date().toISOString().replace(/[:.]/g,'-')}.db`).replaceAll("'","''");this.db.exec(`VACUUM INTO '${target}'`);}
+      this.transaction(()=>{
+        const transcriptColumns=this.db.prepare('PRAGMA table_info(transcript_segments)').all() as unknown as {name:string}[];
+        if(!transcriptColumns.some((column)=>column.name==='speaker_id'))this.db.exec("ALTER TABLE transcript_segments ADD COLUMN speaker_id TEXT NOT NULL DEFAULT 'teacher'");
+        if(!transcriptColumns.some((column)=>column.name==='speaker_name'))this.db.exec("ALTER TABLE transcript_segments ADD COLUMN speaker_name TEXT NOT NULL DEFAULT '老师'");
+        this.db.exec(`CREATE TABLE IF NOT EXISTS manual_note_documents(id TEXT PRIMARY KEY,session_id TEXT NOT NULL UNIQUE REFERENCES class_sessions(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'complete',version INTEGER NOT NULL DEFAULT 0,content_json TEXT NOT NULL DEFAULT '{"type":"doc","content":[]}',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);`);
+        const sessions=this.db.prepare('SELECT id,created_at,updated_at FROM class_sessions').all() as any[];
+        for(const session of sessions)this.db.prepare("INSERT OR IGNORE INTO manual_note_documents VALUES(?,?, 'complete',0,'{\"type\":\"doc\",\"content\":[]}',?,?)").run(randomUUID(),session.id,session.created_at,session.updated_at);
+        this.db.prepare('INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)').run(now());this.db.exec('PRAGMA user_version = 3');
+      });
+    }
   }
 
   private migrateLegacyNotes(): void {
@@ -143,7 +155,7 @@ export class TurtleDatabase {
 
   private course(row: any): Course { return { id: row.id, name: row.name, description: row.description, teacher: row.teacher, tags: parseJson(row.tags), createdAt: row.created_at, updatedAt: row.updated_at }; }
   private session(row: any): ClassSession { return { id: row.id, courseId: row.course_id, name: row.name, date: row.date, startedAt: row.started_at, endedAt: row.ended_at, teacher: row.teacher, tags: parseJson(row.tags), remarks: row.remarks, legalTerms: row.legal_terms, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at }; }
-  private transcript(row: any): TranscriptSegment { return { id: row.id, sessionId: row.session_id, startedAt: row.started_at, endedAt: row.ended_at, originalText: row.original_text, text: row.text, isFinal: Boolean(row.is_final), userEdited: Boolean(row.user_edited), important: Boolean(row.important), ...(row.relevance_category?{relevance:row.relevance_category as RelevanceCategory,relevanceConfidence:Number(row.relevance_confidence),relevanceManual:Boolean(row.relevance_manual)}:{}), createdAt: row.created_at, updatedAt: row.updated_at }; }
+  private transcript(row: any): TranscriptSegment { return { id: row.id, sessionId: row.session_id, startedAt: row.started_at, endedAt: row.ended_at, originalText: row.original_text, text: row.text, speakerId:row.speaker_id||'teacher',speakerName:row.speaker_name||'老师', isFinal: Boolean(row.is_final), userEdited: Boolean(row.user_edited), important: Boolean(row.important), ...(row.relevance_category?{relevance:row.relevance_category as RelevanceCategory,relevanceConfidence:Number(row.relevance_confidence),relevanceManual:Boolean(row.relevance_manual)}:{}), createdAt: row.created_at, updatedAt: row.updated_at }; }
   private block(row: any): NoteBlock { return { id: row.id, noteId: row.note_id, section: row.section, content: row.content, source: row.source, userEdited: Boolean(row.user_edited), locked: Boolean(row.locked), qaId: row.qa_id, position: row.position, createdAt: row.created_at, updatedAt: row.updated_at }; }
   private qa(row: any): QaItem { return { id: row.id, sessionId: row.session_id, source: row.source, question: row.question, completedQuestion: row.completed_question, questionType: row.question_type, isLegal: row.is_legal === null || row.is_legal === undefined ? null : Boolean(row.is_legal), confidence: row.confidence, answer: row.answer, evidence: row.evidence, references: row.references_json, status: row.status, possibleRhetorical: Boolean(row.possible_rhetorical), archived: Boolean(row.archived), readAt: row.read_at, deletedAt: row.deleted_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
 
@@ -175,6 +187,7 @@ export class TurtleDatabase {
       this.db.prepare(`INSERT INTO class_sessions(id,course_id,name,date,started_at,teacher,tags,remarks,legal_terms,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'active',?,?)`).run(id, input.courseId, input.name, input.date, stamp, input.teacher, json(input.tags), input.remarks, input.legalTerms, stamp, stamp);
       for (const type of ['full', 'outline']) this.db.prepare('INSERT INTO note_documents VALUES(?,?,?,?,?,?,?)').run(randomUUID(), id, type, 'waiting', null, stamp, stamp);
       for (const type of ['full', 'outline']) this.db.prepare('INSERT INTO note_documents_v2(id,session_id,type,status,version,content_json,created_at,updated_at) VALUES(?,?,?,\'waiting\',0,\'{"type":"doc","content":[]}\',?,?)').run(randomUUID(),id,type,stamp,stamp);
+      this.db.prepare("INSERT INTO manual_note_documents VALUES(?,?, 'complete',0,'{\"type\":\"doc\",\"content\":[]}',?,?)").run(randomUUID(),id,stamp,stamp);
       this.db.prepare(`INSERT INTO app_preferences(key,value,updated_at) VALUES('currentSessionId',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).run(id, stamp);
     });
     this.index('session',id,input.courseId,id,input.name,[input.date,input.teacher,...input.tags,input.remarks,input.legalTerms].join('\n'));
@@ -197,21 +210,21 @@ export class TurtleDatabase {
   currentSessionId(): string | null { return (this.db.prepare(`SELECT value FROM app_preferences WHERE key='currentSessionId'`).get() as any)?.value ?? null; }
 
   listTranscripts(sessionId: string): TranscriptSegment[] { return this.db.prepare('SELECT t.*,r.category relevance_category,r.confidence relevance_confidence,r.manual relevance_manual FROM transcript_segments t LEFT JOIN transcript_relevance r ON r.segment_id=t.id WHERE t.session_id=? ORDER BY t.started_at,t.created_at').all(sessionId).map((r) => this.transcript(r)); }
-  addTranscript(sessionId: string, input: { startedAt: string; endedAt: string; text: string; clientResultId?: string | undefined }): TranscriptSegment {
+  addTranscript(sessionId: string, input: { startedAt: string; endedAt: string; text: string; originalText?:string|undefined;speakerId?:string|undefined;speakerName?:string|undefined; clientResultId?: string | undefined }): TranscriptSegment {
     const duplicate = input.clientResultId && this.db.prepare('SELECT * FROM transcript_segments WHERE session_id=? AND client_result_id=?').get(sessionId, input.clientResultId);
     if (duplicate) return this.transcript(duplicate);
     const id = randomUUID(), stamp = now();
     this.transaction(() => {
-      this.db.prepare('INSERT INTO transcript_segments VALUES(?,?,?,?,?,?,1,0,0,?,?,?)').run(id, sessionId, input.startedAt, input.endedAt, input.text, input.text, input.clientResultId ?? null, stamp, stamp);
+      this.db.prepare('INSERT INTO transcript_segments(id,session_id,started_at,ended_at,original_text,text,is_final,user_edited,important,client_result_id,created_at,updated_at,speaker_id,speaker_name) VALUES(?,?,?,?,?,?,1,0,0,?,?,?,?,?)').run(id, sessionId, input.startedAt, input.endedAt, input.originalText??input.text, input.text, input.clientResultId ?? null, stamp, stamp,input.speakerId??'teacher',input.speakerName??'老师');
       this.index('transcript', id, this.getSession(sessionId)?.courseId ?? '', sessionId, `转写 ${input.startedAt}`, input.text);
     });
     return this.transcript(this.db.prepare('SELECT t.*,r.category relevance_category,r.confidence relevance_confidence,r.manual relevance_manual FROM transcript_segments t LEFT JOIN transcript_relevance r ON r.segment_id=t.id WHERE t.id=?').get(id));
   }
-  updateTranscript(id: string, patch: { text?: string | undefined; important?: boolean | undefined }): TranscriptSegment | undefined {
+  updateTranscript(id: string, patch: { text?: string | undefined; important?: boolean | undefined;speakerId?:string|undefined;speakerName?:string|undefined }): TranscriptSegment | undefined {
     const row = this.db.prepare('SELECT * FROM transcript_segments WHERE id=?').get(id) as any;
     if (!row) return undefined;
     const text = patch.text ?? row.text, edited = patch.text !== undefined ? 1 : row.user_edited, important = patch.important === undefined ? row.important : Number(patch.important);
-    this.transaction(() => { this.db.prepare('UPDATE transcript_segments SET text=?,user_edited=?,important=?,updated_at=? WHERE id=?').run(text,edited,important,now(),id); this.reindex('transcript', id, row.session_id, text); });
+    this.transaction(() => { this.db.prepare('UPDATE transcript_segments SET text=?,user_edited=?,important=?,speaker_id=?,speaker_name=?,updated_at=? WHERE id=?').run(text,edited,important,patch.speakerId??row.speaker_id??'teacher',patch.speakerName??row.speaker_name??'老师',now(),id); this.reindex('transcript', id, row.session_id, text); });
     return this.transcript(this.db.prepare('SELECT t.*,r.category relevance_category,r.confidence relevance_confidence,r.manual relevance_manual FROM transcript_segments t LEFT JOIN transcript_relevance r ON r.segment_id=t.id WHERE t.id=?').get(id));
   }
 
@@ -269,6 +282,8 @@ export class TurtleDatabase {
     this.db.prepare('INSERT INTO note_revisions_v2 VALUES(?,?,?,?,?,?,?)').run(randomUUID(),documentId,nextVersion-1,nextVersion,json({document,nodes,sources}),reason,now());
   }
   getNoteDocuments(sessionId:string): NoteDocumentV2[] { return (this.db.prepare('SELECT * FROM note_documents_v2 WHERE session_id=? ORDER BY type').all(sessionId) as any[]).map((document)=>this.getNoteDocument(document.id)!).filter(Boolean); }
+  getManualNote(sessionId:string):ManualNoteDocument{let row=this.db.prepare('SELECT * FROM manual_note_documents WHERE session_id=?').get(sessionId) as any;if(!row){const stamp=now(),id=randomUUID();this.db.prepare("INSERT INTO manual_note_documents VALUES(?,?, 'complete',0,'{\"type\":\"doc\",\"content\":[]}',?,?)").run(id,sessionId,stamp,stamp);row=this.db.prepare('SELECT * FROM manual_note_documents WHERE id=?').get(id);}return{id:row.id,sessionId:row.session_id,type:'manual',status:row.status,version:row.version,content:parseJson(row.content_json),nodes:[],pendingSuggestions:0,updatedAt:row.updated_at};}
+  saveManualNote(id:string,baseVersion:number,content:any):ManualNoteDocument{const row=this.db.prepare('SELECT * FROM manual_note_documents WHERE id=?').get(id) as any;if(!row)throw new Error('手写笔记不存在');if(row.version!==baseVersion)throw new Error('手写笔记已在其他位置更新，请重新载入');this.db.prepare("UPDATE manual_note_documents SET content_json=?,version=version+1,status='complete',updated_at=? WHERE id=?").run(json(content),now(),id);return this.getManualNote(row.session_id);}
   getNoteDocument(id:string): NoteDocumentV2|undefined { const row=this.db.prepare('SELECT * FROM note_documents_v2 WHERE id=?').get(id) as any;if(!row)return undefined;return{id:row.id,sessionId:row.session_id,type:row.type,status:row.status,version:row.version,content:parseJson(row.content_json),nodes:(this.db.prepare('SELECT * FROM note_nodes WHERE document_id=? ORDER BY position,id').all(id) as any[]).map((item)=>this.node(item)),pendingSuggestions:Number((this.db.prepare("SELECT COUNT(*) count FROM note_suggestions WHERE document_id=? AND status='pending'").get(id) as any).count),updatedAt:row.updated_at}; }
   saveNoteDocument(id:string,baseVersion:number,content:any,activeNodeId?:string|null):NoteDocumentV2 {
     const current=this.getNoteDocument(id);if(!current)throw new Error('笔记文档不存在');if(current.version!==baseVersion)throw new Error('笔记已在其他位置更新，请重新载入后合并');
@@ -359,6 +374,7 @@ export class TurtleDatabase {
     return this.db.prepare('SELECT * FROM imported_documents WHERE id=?').get(id);
   }
   listDocuments() { return this.db.prepare('SELECT * FROM imported_documents ORDER BY created_at DESC').all(); }
+  materialsForSession(sessionId:string,limit=12000):string{const session=this.getSession(sessionId);if(!session)return'';const rows=this.db.prepare('SELECT d.name,c.heading,c.content FROM document_chunks c JOIN imported_documents d ON d.id=c.document_id WHERE d.course_id IS NULL OR d.course_id=? ORDER BY d.created_at,c.position').all(session.courseId) as any[];let text='';for(const row of rows){const part=`[资料｜${row.name}${row.heading?`｜${row.heading}`:''}] ${row.content}\n`;if(text.length+part.length>limit)break;text+=part;}return text;}
   deleteDocument(id: string): boolean { const chunks = this.db.prepare('SELECT id FROM document_chunks WHERE document_id=?').all(id) as unknown as {id:string}[]; const document=this.db.prepare('SELECT original_path FROM imported_documents WHERE id=?').get(id) as {original_path:string|null}|undefined; this.transaction(() => { chunks.forEach((c) => this.db.prepare('DELETE FROM search_index WHERE source_id=?').run(c.id)); this.db.prepare('DELETE FROM imported_documents WHERE id=?').run(id); }); if(document?.original_path&&existsSync(document.original_path))unlinkSync(document.original_path); return Boolean(document); }
 
   search(query: string, sessionId?: string, courseId?: string) {

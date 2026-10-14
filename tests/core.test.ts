@@ -12,7 +12,7 @@ import { exportSession, parseImport } from '../apps/server/src/files.js';
 import { ClassroomServices } from '../apps/server/src/services.js';
 import { SettingsStore } from '../apps/server/src/settings.js';
 import type { CompletionOptions, LlmProvider } from '../apps/server/src/ai.js';
-import { BrowserTranscriptionProvider, type RecognitionLike, type SpeechStatus } from '../apps/web/src/speech.js';
+import { applyTermCorrections, BrowserTranscriptionProvider, type RecognitionLike, type SpeechStatus } from '../apps/web/src/speech.js';
 import { classifyLocally } from '../apps/server/src/relevance.js';
 
 class MockLlm implements LlmProvider {
@@ -20,6 +20,7 @@ class MockLlm implements LlmProvider {
   async complete(options: CompletionOptions): Promise<string> {
     this.calls.push(options);
     if(options.system.includes('相关性分类器'))return JSON.stringify({category:'substantive_legal',confidence:.9,rationale:'测试法律内容'});
+    if(options.system.includes('融合课堂笔记'))return JSON.stringify({sections:[{title:'融合后的课堂重点',paragraphs:['保留手写观点并补充课堂结构。']}]});
     if(options.system.includes('文档补丁 Schema')){const version=Number(/文档版本：(\d+)/.exec(options.prompt)?.[1]??0),outline=options.system.includes('复习提纲');return JSON.stringify({baseVersion:version,reason:'测试微更新',operations:[{op:'createSection',title:outline?'行政行为要点':'行政行为的合法性',headingLevel:1,parentId:null,content:{type:'paragraph',content:[{type:'text',text:outline?'核心：合法性审查':'老师说明了行政行为合法性的判断方法。'}]},sourceTranscriptIds:[]}]});}
     return JSON.stringify({ answer: '当前课堂依据：应审查行政行为的合法性。\nAI一般知识补充：无。', evidence: '课堂转写 10:00', references: ['课堂转写'] });
   }
@@ -55,6 +56,7 @@ describe('本地规则与设置安全', () => {
     expect(questionCandidate('行政行为为什么必须符合法律规定？')).toBe(true);
     expect(questionCandidate('对不对？')).toBe(false);
     expect(normalizeQuestion(' 什么是 行政行为？？ ')).toBe('什么是行政行为');
+    expect(applyTermCorrections('功伤保险与表见待理','功伤=工伤，表见待理=表见代理')).toBe('工伤保险与表见代理');
   });
 
   it('保存 Key 但读取接口只返回脱敏结果，清除后本地设置仍存在', () => {
@@ -75,13 +77,16 @@ describe('SQLite 持久化、笔记与问答', () => {
     const { course, session } = seed();
     expect(db.updateCourse(course.id,{ name:'行政法专题' })?.name).toBe('行政法专题');
     expect(db.updateSession(session.id,{ remarks:'重点课' })?.remarks).toBe('重点课');
-    const transcript = db.addTranscript(session.id,{ startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'行政行为合法性审查',clientResultId:'result-1' });
+    const transcript = db.addTranscript(session.id,{ startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'行政行为合法性审查',speakerId:'student-1',speakerName:'学生1',clientResultId:'result-1' });
     expect(db.addTranscript(session.id,{ startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'重复文本',clientResultId:'result-1' }).id).toBe(transcript.id);
     expect(db.updateTranscript(transcript.id,{ text:'行政行为的合法性审查',important:true })?.userEdited).toBe(true);
     expect(db.search('行政行为',session.id,course.id).some((result)=>result.sourceType==='transcript')).toBe(true);
     expect(db.search('2026-09-18',session.id,course.id).some((result)=>result.sourceType==='session')).toBe(true);
     expect(db.listTranscripts(session.id)).toHaveLength(1);
+    expect(db.listTranscripts(session.id)[0]?.speakerName).toBe('学生1');
   });
+
+  it('手写笔记独立保存并可与 AI 笔记融合',async()=>{const {session}=seed(),manual=db.getManualNote(session.id);const saved=db.saveManualNote(manual.id,manual.version,{type:'doc',content:[{type:'paragraph',content:[{type:'text',text:'我的课堂判断'}]}]});expect(JSON.stringify(saved.content)).toContain('我的课堂判断');settings.save({...DEFAULT_SETTINGS,apiKey:'unit-key'});const full=db.getNoteDocuments(session.id).find((item)=>item.type==='full')!;db.saveNoteDocument(full.id,full.version,{type:'doc',content:[{type:'paragraph',content:[{type:'text',text:'AI课堂内容'}]}]});const merged=await new ClassroomServices(db,settings,llm).mergeNotes(session.id);expect(JSON.stringify(merged.content)).toContain('融合后的课堂重点');});
 
   it('双版本笔记独立增量更新、锁定用户编辑、保留修订并可撤销', async () => {
     const { session } = seed();
@@ -150,6 +155,16 @@ describe('导入与导出', () => {
     expect(()=>db.addDocument(course.id,'重复','txt',2,'hash',[{heading:'',content:'内容'}])).toThrow('重复');
   });
 
+  it('可把 TXT 资料直接导入独立手写笔记区', async () => {
+    const { session } = seed();
+    const response = await request(createApp({db,settings,llm}).app)
+      .post(`/api/sessions/${session.id}/manual-note/import`)
+      .attach('file',Buffer.from('我的课前提纲\n\n需要课堂核对的观点'),'课前资料.txt')
+      .expect(200);
+    expect(JSON.stringify(response.body.content)).toContain('我的课前提纲');
+    expect(JSON.stringify(db.getManualNote(session.id).content)).toContain('需要课堂核对的观点');
+  });
+
   it('导出中文 DOCX/Markdown/TXT，正文完整且不包含 Key', async () => {
     const {session}=seed(); db.addTranscript(session.id,{startedAt:'2026-09-18T10:00:00',endedAt:'2026-09-18T10:00:03',text:'课堂正文'});
     const note=db.getNotes(session.id)[0]!; db.appendNoteBlocks(note.id,[{section:'本节主题',content:'行政行为'}]);
@@ -194,7 +209,7 @@ describe('内容相关性、结构化文档与持久化恢复',()=>{
 
   it('数据库关闭重启后课程仍存在，健康接口区分真实数据并暴露稳定绝对路径',async()=>{
     const folder=mkdtempSync(join(tmpdir(),'turtle-restart-'));try{const first=new TurtleDatabase(folder);first.createCourse({name:'重启保留课',description:'',teacher:'',tags:[]});first.close();const reopened=new TurtleDatabase(folder);expect(reopened.listCourses()[0]?.name).toBe('重启保留课');reopened.close();}finally{rmSync(folder,{recursive:true,force:true});}
-    const response=await request(createApp({db,settings,llm}).app).get('/api/health').expect(200);expect(response.body).toMatchObject({ok:true,schemaVersion:2,writable:true});expect(response.body.databasePath).toContain('turtle.db');
+    const response=await request(createApp({db,settings,llm}).app).get('/api/health').expect(200);expect(response.body).toMatchObject({ok:true,schemaVersion:3,writable:true});expect(response.body.databasePath).toContain('turtle.db');
   });
 
   it('生产服务同时提供网页、SPA 路由和 API',async()=>{
@@ -202,7 +217,7 @@ describe('内容相关性、结构化文档与持久化恢复',()=>{
   });
 
   it('旧 note_blocks 非破坏迁移到 v2 文档并在迁移前生成备份',()=>{
-    const folder=mkdtempSync(join(tmpdir(),'turtle-migration-'));try{const legacy=new TurtleDatabase(folder);const course=legacy.createCourse({name:'旧课程',description:'',teacher:'',tags:[]}),session=legacy.createSession({courseId:course.id,name:'旧课堂',date:'2026-09-22',teacher:'',tags:[],remarks:'',legalTerms:''}),note=legacy.getNotes(session.id)[0]!;legacy.addUserNoteBlock(note.id,'旧版笔记迁移内容','绝不能丢失的原文字');legacy.db.exec('PRAGMA foreign_keys=OFF; DROP TABLE qa_note_links; DROP TABLE note_node_sources; DROP TABLE note_suggestions; DROP TABLE note_patch_jobs; DROP TABLE note_revisions_v2; DROP TABLE note_nodes; DROP TABLE note_documents_v2; DROP TABLE transcript_relevance; DROP TABLE editor_assets; DROP TABLE transcription_events; DROP TABLE persistence_operations; DROP TABLE audio_recordings; DELETE FROM schema_migrations WHERE version=2; PRAGMA user_version=1;');legacy.close();const migrated=new TurtleDatabase(folder);const document=migrated.getNoteDocuments(session.id)[0]!;expect(document.nodes.some((node)=>node.textContent==='绝不能丢失的原文字')).toBe(true);expect(migrated.getNotes(session.id)[0]?.blocks.some((block)=>block.content==='绝不能丢失的原文字')).toBe(true);expect(readdirSync(join(folder,'backups')).some((name)=>name.startsWith('turtle-pre-migration-v2-'))).toBe(true);migrated.close();}finally{rmSync(folder,{recursive:true,force:true});}
+    const folder=mkdtempSync(join(tmpdir(),'turtle-migration-'));try{const legacy=new TurtleDatabase(folder);const course=legacy.createCourse({name:'旧课程',description:'',teacher:'',tags:[]}),session=legacy.createSession({courseId:course.id,name:'旧课堂',date:'2026-09-22',teacher:'',tags:[],remarks:'',legalTerms:''}),note=legacy.getNotes(session.id)[0]!;legacy.addUserNoteBlock(note.id,'旧版笔记迁移内容','绝不能丢失的原文字');legacy.db.exec('PRAGMA foreign_keys=OFF; DROP TABLE manual_note_documents; DROP TABLE qa_note_links; DROP TABLE note_node_sources; DROP TABLE note_suggestions; DROP TABLE note_patch_jobs; DROP TABLE note_revisions_v2; DROP TABLE note_nodes; DROP TABLE note_documents_v2; DROP TABLE transcript_relevance; DROP TABLE editor_assets; DROP TABLE transcription_events; DROP TABLE persistence_operations; DROP TABLE audio_recordings; DELETE FROM schema_migrations WHERE version>=2; PRAGMA user_version=1;');legacy.close();const migrated=new TurtleDatabase(folder);const document=migrated.getNoteDocuments(session.id)[0]!;expect(document.nodes.some((node)=>node.textContent==='绝不能丢失的原文字')).toBe(true);expect(migrated.getNotes(session.id)[0]?.blocks.some((block)=>block.content==='绝不能丢失的原文字')).toBe(true);expect(readdirSync(join(folder,'backups')).some((name)=>name.startsWith('turtle-pre-migration-v2-'))).toBe(true);migrated.close();}finally{rmSync(folder,{recursive:true,force:true});}
   });
 
   it('损坏设置会保留副本并显示诊断，不静默伪装成正常空设置',()=>{
