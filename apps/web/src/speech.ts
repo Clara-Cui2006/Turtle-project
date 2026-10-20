@@ -8,6 +8,10 @@ export interface RecognitionLike { continuous:boolean;interimResults:boolean;lan
 export interface DiagnosticEvent { type:SpeechEventType;occurredAt:string;detail:string }
 export interface SpeechCallbacks { onInterim(text:string):void;onFinal(text:string):void;onStatus(status:SpeechStatus,detail?:string):void;onEvent?(event:DiagnosticEvent):void }
 
+export function applyTermCorrections(text:string,terms:string):string{
+  return terms.split(/[\n,，;；]+/).reduce((value,item)=>{const pair=item.split(/(?:=>|=|＝|→)/).map((part)=>part.trim());return pair.length===2&&pair[0]&&pair[1]?value.replaceAll(pair[0],pair[1]):value;},text);
+}
+
 export class BrowserTranscriptionProvider {
   private recognition:RecognitionLike|null=null;private desired:'idle'|'listening'|'paused'='idle';private retries=0;private timer:ReturnType<typeof setTimeout>|null=null;private lastFinal='';private lastFinalAt=0;private opening=false;private intentionalEnd=false;
   constructor(private factory:(()=>RecognitionLike)|undefined,private callbacks:SpeechCallbacks,private burstRetries=4){if(!factory)callbacks.onStatus('unsupported','当前浏览器不支持语音识别，请使用最新版 Edge 或 Chrome。');}

@@ -54,11 +54,12 @@ function richDocxChildren(db:TurtleDatabase,content:any):Array<Paragraph|Table>{
 
 export async function exportSession(db:TurtleDatabase,sessionId:string,format:'docx'|'md'|'txt',scope:string){
   const session=db.getSession(sessionId);if(!session)throw new Error('课堂不存在');
-  const course=db.listCourses().find((item)=>item.id===session.courseId),notes=db.getNoteDocuments(sessionId),transcripts=db.listTranscripts(sessionId),qa=db.listQa(sessionId);
+  const course=db.listCourses().find((item)=>item.id===session.courseId),notes=db.getNoteDocuments(sessionId),manual=db.getManualNote(sessionId),transcripts=db.listTranscripts(sessionId),qa=db.listQa(sessionId);
   const include=(part:string)=>scope==='package'||scope===part||(scope==='notes'&&['full','outline'].includes(part));
   const sections:{title:string;lines:string[];content?:any}[]=[{title:session.name,lines:[`课程：${course?.name??''}`,`日期：${session.date}`,`教师：${session.teacher||course?.teacher||''}`]}];
   for(const note of notes)if(include(note.type))sections.push({title:note.type==='full'?'完整版笔记':'提纲版笔记',lines:(note.content as any)?.content?.map(textFrom).filter(Boolean)??[],content:note.content});
-  if(include('transcript'))sections.push({title:'完整转写',lines:transcripts.map((item)=>`[${item.startedAt}]${item.important?' [重点]':''} ${item.text}`)});
+  if(scope==='package')sections.push({title:'我的手写笔记（原稿）',lines:(manual.content as any)?.content?.map(textFrom).filter(Boolean)??[],content:manual.content});
+  if(include('transcript'))sections.push({title:'完整转写',lines:transcripts.map((item)=>`[${item.startedAt}｜${item.speakerName||'未标注'}]${item.important?' [重点]':''} ${item.text}`)});
   if(include('qa'))for(const source of ['auto','manual']){const items=qa.filter((item)=>item.source===source);if(items.length)sections.push({title:source==='auto'?'自动问答':'手动问答',lines:items.flatMap((item)=>[`问题：${item.question}`,`回答：${item.answer}`,`课堂依据：${item.evidence}`,`加入笔记：${item.status}`])});}
   const nonempty=sections.filter((section)=>section.lines.some(Boolean)||section.content),base=`${safeName(course?.name??'课程')}-${safeName(session.name)}-${session.date}`;
   if(format==='docx'){

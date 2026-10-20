@@ -26,6 +26,9 @@ export const transcriptInputSchema = z.object({
   startedAt: z.string(),
   endedAt: z.string(),
   text: z.string().trim().min(1).max(20000),
+  originalText: z.string().trim().min(1).max(20000).optional(),
+  speakerId: z.string().max(100).optional(),
+  speakerName: z.string().trim().max(100).optional(),
   clientResultId: z.string().max(200).optional()
 });
 
@@ -104,7 +107,7 @@ export interface ClassSession extends SessionInput {
   id: string; status: 'active' | 'paused' | 'ended'; startedAt: string | null; endedAt: string | null; createdAt: string; updatedAt: string;
 }
 export interface TranscriptSegment {
-  id: string; sessionId: string; startedAt: string; endedAt: string; originalText: string; text: string; isFinal: boolean; userEdited: boolean; important: boolean; relevance?: RelevanceCategory; relevanceConfidence?: number; relevanceManual?: boolean; createdAt: string; updatedAt: string;
+  id: string; sessionId: string; startedAt: string; endedAt: string; originalText: string; text: string; speakerId?: string; speakerName?: string; isFinal: boolean; userEdited: boolean; important: boolean; relevance?: RelevanceCategory; relevanceConfidence?: number; relevanceManual?: boolean; createdAt: string; updatedAt: string;
 }
 export interface NoteBlock {
   id: string; noteId: string; section: string; content: string; source: 'ai' | 'user' | 'qa'; userEdited: boolean; locked: boolean; qaId: string | null; position: number; createdAt: string; updatedAt: string;
@@ -115,11 +118,12 @@ export interface QaItem {
 }
 export interface NoteNode { id: string; documentId: string; parentId: string | null; type: z.infer<typeof noteNodeTypeSchema>; position: number; headingLevel: number | null; content: unknown; textContent: string; source: 'ai'|'user'|'qa'|'migration'; userEdited: boolean; aiManaged: boolean; version: number; createdAt: string; updatedAt: string; sourceTranscriptIds: string[] }
 export interface NoteDocumentV2 { id: string; sessionId: string; type: 'full'|'outline'; status: string; version: number; content: unknown; nodes: NoteNode[]; pendingSuggestions: number; updatedAt: string }
+export interface ManualNoteDocument { id: string; sessionId: string; type: 'manual'; status: string; version: number; content: unknown; nodes: []; pendingSuggestions: 0; updatedAt: string }
 export interface ApiError { error: { code: string; message: string; details?: unknown } }
 
 export const DEFAULT_SETTINGS: SettingsInput = {
   baseUrl: 'https://api.deepseek.com', noteModel: 'deepseek-flash', autoQaModel: 'deepseek-flash', manualQaModel: 'deepseek-flash', deepModel: 'deepseek-v4-pro',
-  stream: true, thinking: false, autoNotes: true, noteIntervalSeconds: 25, noteTriggerChars: 500,
+  stream: true, thinking: false, autoNotes: true, noteIntervalSeconds: 30, noteTriggerChars: 500,
   autoDetectQuestions: true, autoAnswer: true, autoQaPaused: false, useHistory: true, allowGeneralKnowledge: true, keepOriginalFiles: false,
   filterSmallTalk: true, includeCourseContextInNotes: false, deferUncertainContent: true, showRelevanceLabels: false,
   realtimeMicroUpdates: true, backgroundReorganization: true, organizationSensitivity: 'standard', allowAiReorganization: true, showRevisionNotices: true,

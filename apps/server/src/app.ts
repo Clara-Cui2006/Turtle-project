@@ -28,7 +28,7 @@ function pruneDailyBackups(directory:string):void{
 
 const patchCourseSchema = courseInputSchema.partial().refine((value) => Object.keys(value).length > 0);
 const patchSessionSchema = sessionInputSchema.omit({ courseId: true }).partial().extend({ status: z.enum(['active','paused','ended']).optional(), startedAt: z.string().nullable().optional(), endedAt: z.string().nullable().optional() }).refine((value) => Object.keys(value).length > 0);
-const patchTranscriptSchema = z.object({ text: z.string().trim().min(1).max(20000).optional(), important: z.boolean().optional() }).refine((value) => Object.keys(value).length > 0);
+const patchTranscriptSchema = z.object({ text: z.string().trim().min(1).max(20000).optional(), important: z.boolean().optional(),speakerId:z.string().max(100).optional(),speakerName:z.string().trim().max(100).optional() }).refine((value) => Object.keys(value).length > 0);
 const patchQuestionSchema = z.object({ question: z.string().trim().min(2).max(4000).optional(), answer: z.string().max(30000).optional(), archived: z.boolean().optional() }).refine((value) => Object.keys(value).length > 0);
 
 export interface AppDependencies { db?: TurtleDatabase; settings?: SettingsStore; llm?: LlmProvider; webRoot?: string }
@@ -70,7 +70,7 @@ export function createApp(deps: AppDependencies = {}) {
 
   app.get('/api/sessions', (req, res) => res.json(db.listSessions(typeof req.query.courseId === 'string' ? req.query.courseId : undefined)));
   app.post('/api/sessions', (req, res) => {const key=req.get('Idempotency-Key');if(key){const existing=db.getPersistenceOperation(key);if(existing)return res.status(200).json(existing);}const value=db.createSession(sessionInputSchema.parse(req.body));if(key)db.savePersistenceOperation(key,'POST',req.path,value);res.status(201).json(value);});
-  app.get('/api/sessions/:id', (req, res) => { const session = db.getSession(req.params.id!); if(session)res.json({ ...session, transcripts: db.listTranscripts(session.id), notes: db.getNotes(session.id), noteDocuments:db.getNoteDocuments(session.id), qa: db.listQa(session.id) });else res.status(404).json({ error: { code: 'NOT_FOUND', message: '课堂不存在' } }); });
+  app.get('/api/sessions/:id', (req, res) => { const session = db.getSession(req.params.id!); if(session)res.json({ ...session, transcripts: db.listTranscripts(session.id), notes: db.getNotes(session.id), noteDocuments:db.getNoteDocuments(session.id),manualNote:db.getManualNote(session.id), qa: db.listQa(session.id) });else res.status(404).json({ error: { code: 'NOT_FOUND', message: '课堂不存在' } }); });
   app.patch('/api/sessions/:id', (req, res) => { const value = db.updateSession(req.params.id!, patchSessionSchema.parse(req.body)); if(value)res.json(value);else res.status(404).json({ error: { code: 'NOT_FOUND', message: '课堂不存在' } }); });
   app.delete('/api/sessions/:id', (req, res) => db.deleteSession(req.params.id!) ? res.status(204).end() : res.status(404).json({ error: { code: 'NOT_FOUND', message: '课堂不存在' } }));
 
@@ -92,6 +92,9 @@ export function createApp(deps: AppDependencies = {}) {
   app.post('/api/note-documents/:id/patch',(req,res)=>{const input=notePatchSchema.parse(req.body);res.json(db.applyNotePatch(req.params.id!,input.baseVersion,input.reason,input.operations));});
   app.post('/api/note-documents/:id/reorganize',async(req,res,next)=>{try{const document=db.getNoteDocument(req.params.id!);if(!document)throw new Error('笔记文档不存在');await services.updateNotes(document.sessionId,true);res.json(db.getNoteDocument(document.id));}catch(error){next(error);}});
   app.post('/api/note-documents/:id/undo',(req,res)=>{const value=db.undoNoteDocument(req.params.id!);if(value)res.json(value);else res.status(409).json({error:{code:'NO_REVISION',message:'没有可撤销修订'}});});
+  app.patch('/api/manual-notes/:id',(req,res)=>{const input=noteDocumentUpdateSchema.parse(req.body);res.json(db.saveManualNote(req.params.id!,input.baseVersion,input.content));});
+  app.post('/api/sessions/:id/manual-note/import',upload.single('file'),async(req,res,next)=>{try{if(!req.file)throw new Error('请选择文件');const parsed=await parseImport(req.file.originalname,req.file.buffer),manual=db.getManualNote(String(req.params.id)),blocks=Array.isArray((manual.content as any)?.content)?[...(manual.content as any).content]:[];for(const chunk of parsed.chunks){if(chunk.heading)blocks.push({type:'heading',attrs:{level:2},content:[{type:'text',text:chunk.heading}]});blocks.push({type:'paragraph',content:[{type:'text',text:chunk.content}]});}res.json(db.saveManualNote(manual.id,manual.version,{type:'doc',content:blocks}));}catch(error){next(error);}});
+  app.post('/api/sessions/:id/notes/merge',async(req,res,next)=>{try{res.json(await services.mergeNotes(String(req.params.id)));}catch(error){next(error);}});
 
   app.get('/api/sessions/:id/questions', (req, res) => res.json(db.listQa(req.params.id!)));
   app.post('/api/sessions/:id/questions/detect', async (req, res, next) => { try { const { text } = z.object({ text: z.string().min(1) }).parse(req.body); await services.detectAndAnswer(req.params.id!, text); res.json(db.listQa(req.params.id!)); } catch (error) { next(error); } });

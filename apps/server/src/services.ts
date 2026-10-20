@@ -6,6 +6,7 @@ import { LEGAL_GUARDRAILS, parseJson, withRetry, type LlmProvider } from './ai.j
 import { classifyLocally, classifyWithContext, type RelevanceResult } from './relevance.js';
 
 const answerResponseSchema = z.object({ answer: z.string().min(1), evidence: z.string(), references: z.array(z.string()).default([]) });
+const mergedNotesSchema=z.object({sections:z.array(z.object({title:z.string().min(1).max(200),paragraphs:z.array(z.string().min(1).max(10000)).min(1).max(20)})).min(1).max(40)});
 const legacyNoteResponseSchema = z.object({ blocks: z.array(z.object({ section: z.string().min(1), content: z.string().min(1) })).min(1).max(12) });
 const plainText=(value:any):string=>typeof value?.text==='string'?value.text:Array.isArray(value?.content)?value.content.map(plainText).join(''):'';
 const questionType=(text:string)=>/(案例|甲|乙|事实|争点)/.test(text)?'case':/(第.{0,8}条|法条|条文)/.test(text)?'statute':/(学说|争议|观点)/.test(text)?'theory':/(区别|比较|关系)/.test(text)?'comparison':'concept';
@@ -65,11 +66,11 @@ export class ClassroomServices {
       if (!pending.length) return;
       const controller = new AbortController(); this.controllers.set(`note-v2:${document.id}`, controller);
       this.db.db.prepare(`UPDATE note_documents_v2 SET status='generating',updated_at=? WHERE id=?`).run(new Date().toISOString(),document.id);
-      const transcript = pending.map((t) => `[${t.startedAt}] ${t.text}`).join('\n').slice(-18000);
+      const transcript = pending.map((t) => `[${t.startedAt}｜${t.speakerName||'未标注'}] ${t.text}`).join('\n').slice(-18000),materials=this.db.materialsForSession(sessionId,6000);
       const relevantNodes=document.nodes.slice(-40).map((node)=>({id:node.id,parentId:node.parentId,type:node.type,headingLevel:node.headingLevel,text:node.textContent,userEdited:node.userEdited,aiManaged:node.aiManaged}));
       const format = document.type === 'full' ? '维护详细连续的法律课堂讲义' : '维护简洁、层级清晰且不重复完整版的复习提纲';
       try {
-        const raw = await withRetry(() => this.llm.complete({ model: settings.noteModel, system: `${LEGAL_GUARDRAILS}\n${format}。根据真实授课逻辑回到已有节点补充、建立关系或转换表格，不要机械追加，不要创建空模板。用户编辑节点绝不能覆盖。只输出符合文档补丁 Schema 的 JSON：{"baseVersion":数字,"reason":"原因","operations":[...]}`, prompt: `文档版本：${document.version}\n现有相关节点：\n${JSON.stringify(relevantNodes)}\n\n新增法律课程语义单元：\n${transcript}`, signal: controller.signal, json: true }));
+        const raw = await withRetry(() => this.llm.complete({ model: settings.noteModel, system: `${LEGAL_GUARDRAILS}\n${format}。根据真实授课逻辑回到已有节点补充、建立关系或转换表格，不要机械追加，不要创建空模板。用户编辑节点绝不能覆盖。只输出符合文档补丁 Schema 的 JSON：{"baseVersion":数字,"reason":"原因","operations":[...]}`, prompt: `文档版本：${document.version}\n现有相关节点：\n${JSON.stringify(relevantNodes)}\n\n新增法律课程语义单元：\n${transcript}\n\n相关导入资料（只作资料补充，必须与课堂内容区分）：\n${materials||'无'}`, signal: controller.signal, json: true }));
         let parsed;try{parsed=parseJson(raw,notePatchSchema);}catch{const fallback=parseJson(raw,legacyNoteResponseSchema);parsed={baseVersion:document.version,reason:'兼容旧模型输出',operations:fallback.blocks.flatMap((block)=>[{op:'createSection' as const,title:block.section,headingLevel:2,parentId:null,content:{type:'paragraph',content:[{type:'text',text:block.content}]},sourceTranscriptIds:pending.map((item)=>item.id)}])};}
         this.db.applyNotePatch(document.id,document.version,parsed.reason,parsed.operations);
         this.db.db.prepare('UPDATE note_documents_v2 SET last_processed_at=?,status=\'complete\',updated_at=? WHERE id=?').run(pending.at(-1)!.createdAt,new Date().toISOString(),document.id);
@@ -80,6 +81,15 @@ export class ClassroomServices {
     const failure=results.find((result):result is PromiseRejectedResult=>result.status==='rejected');
     if(failure)throw failure.reason;
     return this.db.getNotes(sessionId);
+  }
+
+  async mergeNotes(sessionId:string){
+    const settings=this.settings.getPrivate(),manual=this.db.getManualNote(sessionId),full=this.db.getNoteDocuments(sessionId).find((item)=>item.type==='full');if(!full)throw new Error('完整版笔记不存在');
+    const manualText=plainText(manual.content),generatedText=plainText(full.content),materials=this.db.materialsForSession(sessionId,5000);
+    if(!manualText&&!generatedText)throw new Error('当前没有可融合的笔记');
+    const raw=await withRetry(()=>this.llm.complete({model:settings.noteModel,json:true,system:`${LEGAL_GUARDRAILS}\n你负责融合课堂笔记。保留学生手写内容的观点与措辞，去重并用 AI 实时笔记补齐结构；资料内容必须明确标注“资料补充”，不得冒充课堂原话。只输出 JSON：{"sections":[{"title":"标题","paragraphs":["正文"]}]}`,prompt:`学生手写笔记：\n${manualText||'无'}\n\nAI 实时笔记：\n${generatedText||'无'}\n\n导入资料：\n${materials||'无'}`}));
+    const merged=parseJson(raw,mergedNotesSchema),content={type:'doc',content:merged.sections.flatMap((section)=>[{type:'heading',attrs:{level:1},content:[{type:'text',text:section.title}]},...section.paragraphs.map((paragraph)=>({type:'paragraph',content:[{type:'text',text:paragraph}]}))])};
+    return this.db.saveNoteDocument(full.id,full.version,content);
   }
 
   async detectAndAnswer(sessionId: string, text: string): Promise<void> {
