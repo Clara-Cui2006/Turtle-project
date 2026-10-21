@@ -9,7 +9,7 @@
     "dev": "concurrently -k -n server,web -c blue,green \"npm run dev -w @turtle/server\" \"npm run dev -w @turtle/web\"",
     "start": "npm run start -w @turtle/server",
     "build": "npm run build -w @turtle/shared && npm run build -w @turtle/server && npm run build -w @turtle/web",
-    "test": "vitest run --pool=vmThreads --maxWorkers=1 --minWorkers=1",
+    "test": "vitest run --pool=forks --maxWorkers=1 --minWorkers=1",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "eslint . --max-warnings=0"
   },

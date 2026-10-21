@@ -1,3 +1,8 @@
+param(
+  [switch]$NoBrowser,
+  [switch]$SkipBuild
+)
+
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $appUrl = 'http://127.0.0.1:5173'
@@ -17,17 +22,20 @@ function Test-TurtleService {
 Set-Location $projectRoot
 
 if (-not (Test-TurtleService)) {
-  $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
-  & $npm run build
-  if ($LASTEXITCODE -ne 0) { throw 'Turtle build failed.' }
+  if (-not $SkipBuild) {
+    $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
+    & $npm run build
+    if ($LASTEXITCODE -ne 0) { throw 'Turtle build failed.' }
+  }
+  if (-not (Test-Path (Join-Path $projectRoot 'apps\server\dist\index.js')) -or -not (Test-Path (Join-Path $projectRoot 'apps\web\dist\index.html'))) {
+    throw 'Turtle build files are missing. Run start-turtle.cmd once.'
+  }
 
   New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
-  $stdout = Join-Path $logRoot 'app.log'
   $stderr = Join-Path $logRoot 'app-error.log'
-  $node = (Get-Command node.exe -ErrorAction Stop).Source
-  $npmCli = Join-Path (Split-Path $npm) 'node_modules\npm\bin\npm-cli.js'
-  $env:PORT = '5173'
-  Start-Process -FilePath $node -ArgumentList @("`"$npmCli`"",'run','start') -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+  $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
+  $runner = Join-Path $projectRoot 'run-turtle-service.ps1'
+  Start-Process -FilePath $powershell -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$runner`"") -WorkingDirectory $projectRoot -WindowStyle Hidden
 
   $ready = $false
   for ($attempt = 0; $attempt -lt 60; $attempt++) {
@@ -37,4 +45,4 @@ if (-not (Test-TurtleService)) {
   if (-not $ready) { throw "Turtle failed to start. See: $stderr" }
 }
 
-Start-Process $appUrl
+if (-not $NoBrowser) { Start-Process $appUrl }
